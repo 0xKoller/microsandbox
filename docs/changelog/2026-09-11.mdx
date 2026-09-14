@@ -29,5 +29,5 @@ See [Hostname rules and HTTPS](/networking/overview#hostname-rules-and-https) an
 
 ## Bug fixes
 
-- HTTP host policy checks now match the hostname that policy allowed, closing a gap where a mismatched `Host` header could bypass a hostname-based allow rule.
+- HTTP host policy checks now match the hostname that the policy allowed, closing a gap where a mismatched `Host` header could bypass a hostname-based allow rule.
 - `/dev/stdin`, `/dev/stdout`, and `/dev/stderr` are now created during guest initialization alongside `/dev/fd`. Commands such as `printf 'echo hello\n' | bash /dev/stdin` work inside sandboxes, and existing entries are preserved when initialization runs again.
