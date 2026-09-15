@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -27,9 +28,6 @@ const TCP_RX_BUF_SIZE: usize = 65536;
 
 /// TCP socket transmit buffer size (64 KiB).
 const TCP_TX_BUF_SIZE: usize = 65536;
-
-/// Default max concurrent connections.
-const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
 /// Capacity of the mpsc channels between the poll loop and proxy tasks.
 const CHANNEL_CAPACITY: usize = 32;
@@ -79,7 +77,7 @@ pub struct ConnectionTracker {
     /// Secondary index for O(1) duplicate-SYN detection by (src, dst) 4-tuple.
     connection_keys: HashSet<(SocketAddr, SocketAddr)>,
     /// Max concurrent connections (from NetworkConfig).
-    max_connections: usize,
+    max_connections: Option<NonZeroUsize>,
     rejected_connections: u64,
 }
 
@@ -202,11 +200,11 @@ impl Default for ProxyConnectState {
 
 impl ConnectionTracker {
     /// Create a new tracker with the given connection limit.
-    pub fn new(max_connections: Option<usize>) -> Self {
+    pub fn new(max_connections: Option<NonZeroUsize>) -> Self {
         Self {
             connections: HashMap::new(),
             connection_keys: HashSet::new(),
-            max_connections: max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            max_connections,
             rejected_connections: 0,
         }
     }
@@ -232,9 +230,21 @@ impl ConnectionTracker {
         dst: SocketAddr,
         sockets: &mut SocketSet<'_>,
     ) -> bool {
-        if self.connections.len() >= self.max_connections {
-            self.rejected_connections = self.rejected_connections.saturating_add(1);
-            return false;
+        if self
+            .max_connections
+            .is_some_and(|max| self.connections.len() >= max.get())
+        {
+            // Reclaim completed flows before rejecting a burst. Existing
+            // listeners have already consumed their SYN in the poll loop;
+            // an idle listener here is an invalid or reset handshake.
+            self.cleanup_closed(sockets);
+            if self
+                .max_connections
+                .is_some_and(|max| self.connections.len() >= max.get())
+            {
+                self.rejected_connections = self.rejected_connections.saturating_add(1);
+                return false;
+            }
         }
 
         // Create smoltcp TCP socket with buffers.
@@ -455,14 +465,17 @@ impl ConnectionTracker {
 
     /// Remove closed connections and their sockets.
     ///
-    /// Only removes sockets in the `Closed` state. Sockets in `TimeWait`
-    /// are left for smoltcp to handle naturally (2*MSL timer), preventing
-    /// delayed duplicate segments from being accepted by a reused port.
+    /// Idle listeners represent failed/reset SYNs: this tracker never owns
+    /// persistent listening sockets. Closed sockets with a remote endpoint
+    /// still owe the guest an RST and must survive until smoltcp emits it.
+    /// TIME_WAIT remains intact to reject delayed duplicate segments.
     pub fn cleanup_closed(&mut self, sockets: &mut SocketSet<'_>) {
         let keys = &mut self.connection_keys;
         self.connections.retain(|&handle, conn| {
             let socket = sockets.get::<tcp::Socket>(handle);
-            if matches!(socket.state(), tcp::State::Closed) {
+            if matches!(socket.state(), tcp::State::Closed | tcp::State::Listen)
+                && socket.remote_endpoint().is_none()
+            {
                 keys.remove(&(conn.src, conn.dst));
                 sockets.remove(handle);
                 false
@@ -516,5 +529,26 @@ fn write_proxy_data(socket: &mut tcp::Socket<'_>, conn: &mut Connection) {
             }
             Err(_) => break,
         }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_limit_tracks_more_than_the_previous_default() {
+        let mut tracker = ConnectionTracker::new(None);
+        let mut sockets = SocketSet::new(Vec::new());
+        let dst = "198.51.100.1:443".parse().unwrap();
+        for port in 10000..10300 {
+            let src = SocketAddr::from(([192, 0, 2, 1], port));
+            assert!(tracker.create_tcp_socket(src, dst, &mut sockets));
+        }
+        assert_eq!(tracker.connections.len(), 300);
     }
 }

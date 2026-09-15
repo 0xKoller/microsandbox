@@ -4,6 +4,7 @@
 //! for sandbox networking. Designed for the smoltcp in-process engine.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroUsize;
 
 use ipnetwork::{Ipv4Network, Ipv6Network};
 use microsandbox_types::{NetworkRateLimiterConfig, TlsConfig};
@@ -15,19 +16,18 @@ use crate::proxy::{OutboundProxy, ResolvedOutboundProxy};
 use crate::secrets::config::SecretsConfig;
 
 //--------------------------------------------------------------------------------------------------
-// Constants
-//--------------------------------------------------------------------------------------------------
-
-/// Maximum accepted value for [`NetworkConfig::max_connections`].
-///
-/// The smoltcp stack allocates per-connection socket buffers, so unusually
-/// large values can become a host-memory footgun before policy has a chance
-/// to reject traffic.
-pub const MAX_NETWORK_CONNECTIONS: usize = 4096;
-
-//--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
+
+/// Explicit connection limit, serialized as zero for unlimited or a positive cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "usize", into = "usize")]
+pub enum ConnectionLimit {
+    /// No connection-count cap.
+    Unlimited,
+    /// Maximum number of concurrent connections.
+    Limited(NonZeroUsize),
+}
 
 /// Complete network configuration for a sandbox.
 ///
@@ -69,9 +69,9 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub secrets: SecretsConfig,
 
-    /// Max concurrent guest connections. Default: 256, maximum: 4096.
+    /// Guest connection cap. `None` uses the deployment profile's default.
     #[serde(default)]
-    pub max_connections: Option<usize>,
+    pub max_connections: Option<ConnectionLimit>,
 
     /// Egress and ingress rate limits. `None` means unlimited in both directions.
     #[serde(default)]
@@ -193,6 +193,16 @@ pub enum PortProtocol {
 // Methods
 //--------------------------------------------------------------------------------------------------
 
+impl ConnectionLimit {
+    /// Return the effective cap used by the network stack.
+    pub const fn cap(self) -> Option<NonZeroUsize> {
+        match self {
+            Self::Unlimited => None,
+            Self::Limited(limit) => Some(limit),
+        }
+    }
+}
+
 impl ResolvedNetworkConfig {
     /// Creates a runtime configuration from its declarative configuration and
     /// fully resolved outbound proxy.
@@ -232,6 +242,21 @@ impl ResolvedNetworkConfig {
 //--------------------------------------------------------------------------------------------------
 // Trait Implementations
 //--------------------------------------------------------------------------------------------------
+
+impl From<usize> for ConnectionLimit {
+    fn from(value: usize) -> Self {
+        match NonZeroUsize::new(value) {
+            Some(limit) => Self::Limited(limit),
+            None => Self::Unlimited,
+        }
+    }
+}
+
+impl From<ConnectionLimit> for usize {
+    fn from(value: ConnectionLimit) -> Self {
+        value.cap().map_or(0, NonZeroUsize::get)
+    }
+}
 
 impl Default for NetworkConfig {
     fn default() -> Self {
@@ -513,5 +538,53 @@ mod tests {
             serde_json::from_str::<PortProtocol>("\"Udp\"").unwrap(),
             PortProtocol::Udp
         );
+    }
+}
+
+#[cfg(test)]
+mod connection_limit_tests {
+    use super::*;
+
+    #[test]
+    fn wire_connection_limits_preserve_default_and_unlimited_through_spec() {
+        for requested in [None, Some(0), Some(64), Some(4096)] {
+            let config: NetworkConfig =
+                serde_json::from_value(serde_json::json!({"max_connections": requested})).unwrap();
+            assert_eq!(config.max_connections, requested.map(ConnectionLimit::from));
+            let spec: microsandbox_types::NetworkSpec =
+                serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+            assert_eq!(spec.max_connections, requested);
+            let back: NetworkConfig =
+                serde_json::from_value(serde_json::to_value(spec).unwrap()).unwrap();
+            assert_eq!(back.max_connections, config.max_connections);
+        }
+    }
+
+    #[test]
+    fn wire_limits_normalize_zero_and_preserve_positive_caps() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"max_connections": null}),
+        ] {
+            let config: NetworkConfig = serde_json::from_value(value).unwrap();
+            assert_eq!(config.max_connections, None);
+        }
+
+        let config: NetworkConfig =
+            serde_json::from_value(serde_json::json!({"max_connections": 64})).unwrap();
+        assert_eq!(
+            config.max_connections,
+            Some(ConnectionLimit::Limited(NonZeroUsize::new(64).unwrap()))
+        );
+        assert_eq!(serde_json::to_value(config).unwrap()["max_connections"], 64);
+
+        for value in [serde_json::json!(-1), serde_json::json!("unlimited")] {
+            assert!(
+                serde_json::from_value::<NetworkConfig>(
+                    serde_json::json!({"max_connections": value})
+                )
+                .is_err()
+            );
+        }
     }
 }

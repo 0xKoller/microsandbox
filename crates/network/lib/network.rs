@@ -6,6 +6,7 @@
 //! the networking stack.
 
 use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -19,7 +20,7 @@ use microsandbox_types::{
 };
 use msb_krun::backends::net::NetBackend;
 
-use crate::config::{MAX_NETWORK_CONNECTIONS, ResolvedNetworkConfig};
+use crate::config::{ConnectionLimit, ResolvedNetworkConfig};
 use crate::netstack::{
     backend::SmoltcpBackend,
     poll::{self, GatewayIps, PollLoopConfig},
@@ -33,11 +34,8 @@ use crate::tls::state::{TlsState, TlsStateError};
 // Constants
 //--------------------------------------------------------------------------------------------------
 
-/// Hard ceiling for concurrent connections on shared, multi-tenant hosts.
-///
-/// This matches the network engine's existing default, preventing a tenant
-/// override from increasing host-side socket state above the normal budget.
-const MULTI_TENANT_MAX_CONNECTIONS: usize = 256;
+/// Default connection cap for multi-tenant deployments; explicit settings override it.
+const DEFAULT_MULTI_TENANT_MAX_CONNECTIONS: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -187,15 +185,6 @@ impl SmoltcpNetwork {
         let resolved_config = config;
         let config = resolved_config.config();
 
-        if let Some(configured) = config.max_connections
-            && configured > MAX_NETWORK_CONNECTIONS
-        {
-            return Err(NetworkInitError::MaxConnectionsExceeded {
-                configured,
-                limit: MAX_NETWORK_CONNECTIONS,
-            });
-        }
-
         let guest_mac = config
             .interface
             .mac
@@ -228,11 +217,9 @@ impl SmoltcpNetwork {
         };
         let gateway_ipv6 = guest_ipv6.map(gateway_from_guest_ipv6);
 
-        let queue_capacity = config
-            .max_connections
-            .unwrap_or(DEFAULT_QUEUE_CAPACITY)
-            .max(DEFAULT_QUEUE_CAPACITY);
-        let shared = Arc::new(SharedState::new(queue_capacity));
+        // Packet queue capacity is independent of the optional connection cap:
+        // a large cap must not allocate a correspondingly large packet queue.
+        let shared = Arc::new(SharedState::new(DEFAULT_QUEUE_CAPACITY));
         // Every write path validates rate limiters (`NetworkBuilder::build`),
         // but a stored config bypasses the builder: fail startup cleanly
         // instead of panicking on a corrupted spec.
@@ -329,7 +316,7 @@ impl SmoltcpNetwork {
         let tls_state = self.tls_state.clone();
         let published_ports = config.ports.clone();
         let strict = config.strict;
-        let max_connections = config.max_connections;
+        let max_connections = config.max_connections.and_then(ConnectionLimit::cap);
         let secrets = self.secrets.clone();
         let outbound_proxy = self.config.outbound_proxy().cloned().map(Arc::new);
 
@@ -534,6 +521,11 @@ fn enforce_deployment_profile(config: &mut ResolvedNetworkConfig, profile: Deplo
     config.clear_outbound_proxy();
 
     let config = config.config_mut();
+    config
+        .max_connections
+        .get_or_insert(ConnectionLimit::Limited(
+            DEFAULT_MULTI_TENANT_MAX_CONNECTIONS,
+        ));
     let interface_overridden = config.interface.mac.is_some()
         || config.interface.mtu.is_some()
         || config.interface.ipv4_address.is_some()
@@ -545,29 +537,17 @@ fn enforce_deployment_profile(config: &mut ResolvedNetworkConfig, profile: Deplo
     let disabled_rebind_protection = !config.dns.rebind_protection;
     let trusted_host_cas = config.trust_host_cas;
     let had_outbound_proxy = config.outbound_proxy.is_some();
-    let connection_limit_clamped = config
-        .max_connections
-        .is_some_and(|limit| limit > MULTI_TENANT_MAX_CONNECTIONS);
-
     config.interface = Default::default();
     config.ports.clear();
     config.dns.nameservers.clear();
     config.dns.rebind_protection = true;
     config.trust_host_cas = false;
-    config.max_connections = Some(
-        config
-            .max_connections
-            .unwrap_or(MULTI_TENANT_MAX_CONNECTIONS)
-            .min(MULTI_TENANT_MAX_CONNECTIONS),
-    );
-
     if interface_overridden
         || had_published_ports
         || had_custom_nameservers
         || disabled_rebind_protection
         || trusted_host_cas
         || had_outbound_proxy
-        || connection_limit_clamped
     {
         tracing::warn!(
             interface_overridden,
@@ -576,7 +556,6 @@ fn enforce_deployment_profile(config: &mut ResolvedNetworkConfig, profile: Deplo
             disabled_rebind_protection,
             trusted_host_cas,
             had_outbound_proxy,
-            connection_limit_clamped,
             "multi-tenant deployment profile overrode unsafe network configuration"
         );
     }
@@ -733,7 +712,7 @@ mod tests {
             address: "127.0.0.1:1080".parse().unwrap(),
             credentials: None,
         });
-        config.max_connections = Some(MULTI_TENANT_MAX_CONNECTIONS + 1);
+        config.max_connections = Some(ConnectionLimit::from(257));
         config.policy = NetworkPolicy::allow_all();
         let mut resolved = resolved(config);
 
@@ -747,12 +726,52 @@ mod tests {
         assert!(config.dns.rebind_protection);
         assert!(!config.trust_host_cas);
         assert!(config.outbound_proxy.is_none());
-        assert_eq!(config.max_connections, Some(MULTI_TENANT_MAX_CONNECTIONS));
+        assert_eq!(config.max_connections, Some(ConnectionLimit::from(257)));
         assert!(resolved.config().outbound_proxy.is_none());
         assert!(resolved.outbound_proxy().is_none());
         // Tenant policy stays intact and is intersected with the platform
         // policy at evaluation time instead of being reordered or flattened.
         assert!(config.policy.default_egress.is_allow());
+    }
+
+    #[test]
+    fn deployment_profile_defaults_and_explicit_connection_limits() {
+        for profile in [
+            DeploymentProfile::SingleTenant,
+            DeploymentProfile::MultiTenant,
+        ] {
+            for requested in [None, Some(0), Some(64), Some(4096)] {
+                let config: NetworkConfig =
+                    serde_json::from_value(serde_json::json!({"max_connections": requested}))
+                        .unwrap();
+                let mut config = resolved(config);
+                // Exercise the serialized runtime launch boundary as well.
+                config = serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+                enforce_deployment_profile(&mut config, profile);
+                let expected = requested
+                    .or(match profile {
+                        DeploymentProfile::SingleTenant => None,
+                        DeploymentProfile::MultiTenant => Some(1024),
+                    })
+                    .and_then(NonZeroUsize::new);
+                assert_eq!(
+                    config
+                        .config()
+                        .max_connections
+                        .and_then(ConnectionLimit::cap),
+                    expected
+                );
+                // Applying the profile again must preserve the resolved value.
+                enforce_deployment_profile(&mut config, profile);
+                assert_eq!(
+                    config
+                        .config()
+                        .max_connections
+                        .and_then(ConnectionLimit::cap),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]
@@ -1023,30 +1042,19 @@ mod tests {
     }
 
     #[test]
-    fn build_rejects_excessive_max_connections() {
-        let mut config = NetworkConfig {
-            max_connections: Some(MAX_NETWORK_CONNECTIONS + 1),
-            ..NetworkConfig::default()
-        };
-        config.tls.enabled = false;
-
-        let err = match SmoltcpNetwork::build(
-            resolved(config),
-            0,
-            DeploymentProfile::SingleTenant,
-            routes(true, false),
-        ) {
-            Ok(_) => panic!("excessive max_connections should fail"),
-            Err(err) => err,
-        };
-
-        assert!(matches!(
-            err,
-            NetworkInitError::MaxConnectionsExceeded {
-                configured,
-                limit: MAX_NETWORK_CONNECTIONS
-            } if configured == MAX_NETWORK_CONNECTIONS + 1
-        ));
+    fn large_connection_cap_does_not_preallocate_or_prevent_startup() {
+        for limit in [10000, usize::MAX] {
+            let mut config = NetworkConfig::default();
+            config.tls.enabled = false;
+            config.max_connections = Some(ConnectionLimit::from(limit));
+            let net = SmoltcpNetwork::build(
+                resolved(config),
+                0,
+                DeploymentProfile::MultiTenant,
+                routes(true, false),
+            );
+            assert!(net.is_ok(), "large explicit cap should allow startup");
+        }
     }
 
     /// A stored config bypasses the builder's validation, so an invalid
