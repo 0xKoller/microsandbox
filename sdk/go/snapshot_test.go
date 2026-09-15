@@ -9,6 +9,45 @@ import (
 	"github.com/superradcompany/microsandbox/sdk/go/internal/ffi"
 )
 
+type snapshotSaver interface {
+	SaveTo(context.Context, string, SnapshotSaveOptions) error
+}
+
+type snapshotCopier interface {
+	CopyTo(string) *SnapshotCopyBuilder
+}
+
+var (
+	_ snapshotSaver  = (*SnapshotArtifact)(nil)
+	_ snapshotSaver  = (*SnapshotHandle)(nil)
+	_ snapshotCopier = (*SnapshotArtifact)(nil)
+)
+
+func TestSnapshotCopyBuilderCopiesMutableInput(t *testing.T) {
+	snapshot := &SnapshotArtifact{reference: "/snapshots/example", referenceKind: "path"}
+	labels := map[string]string{"environment": "test"}
+	builder := snapshot.CopyTo("/tmp/copied.tar.zst").Labels(labels).RecordIntegrity(true)
+	labels["environment"] = "changed"
+
+	if got := builder.labels["environment"]; got != "test" {
+		t.Fatalf("builder label = %q, want %q", got, "test")
+	}
+	if !builder.recordIntegrity {
+		t.Fatal("builder recordIntegrity = false, want true")
+	}
+	if builder.outputArchivePath != "/tmp/copied.tar.zst" {
+		t.Fatalf("builder output path = %q", builder.outputArchivePath)
+	}
+}
+
+func TestZeroSnapshotCopyBuilderFailsCleanly(t *testing.T) {
+	var builder SnapshotCopyBuilder
+	err := builder.Save(context.Background())
+	if !IsKind(err, ErrInvalidConfig) {
+		t.Fatalf("Save error = %v, want ErrInvalidConfig", err)
+	}
+}
+
 func TestSnapshotCreateEmptyName(t *testing.T) {
 	_, err := Snapshot.Create(context.Background(), SnapshotCreateOptions{FromSandbox: "baseline"})
 	if !IsKind(err, ErrInvalidConfig) {
@@ -103,5 +142,30 @@ func TestSnapshotStateProjectionDistinguishesMissingAndMerkleIntegrity(t *testin
 	got := withMerkle.File.Integrity
 	if got.Algorithm != algorithm || got.Digest != root || got.Root != root || got.LogicalSize != logicalSize || got.LeafSize != leafSize {
 		t.Fatalf("Merkle integrity projection = %#v", got)
+	}
+}
+
+func TestLegacySnapshotPaths(t *testing.T) {
+	path := "/local/snapshot"
+	snapshot := snapshotFromInfo(&ffi.SnapshotInfo{Path: &path, Reference: path, ReferenceKind: "path"})
+	handle := snapshotHandleFromInfo(&ffi.SnapshotHandleInfo{Path: &path, Reference: path, ReferenceKind: "path"})
+	if snapshot.Path() != path || handle.Path() != path {
+		t.Fatal("legacy accessors did not preserve local path")
+	}
+	for _, kind := range []string{"id", "path"} {
+		t.Run(kind, func(t *testing.T) {
+			remoteSnapshot := snapshotFromInfo(&ffi.SnapshotInfo{Reference: "/remote/snapshot", ReferenceKind: kind})
+			remoteHandle := snapshotHandleFromInfo(&ffi.SnapshotHandleInfo{Reference: "/remote/snapshot", ReferenceKind: kind})
+			for name, accessor := range map[string]func() string{"snapshot": remoteSnapshot.Path, "handle": remoteHandle.Path} {
+				t.Run(name, func(t *testing.T) {
+					defer func() {
+						if recover() == nil {
+							t.Fatal("remote path accessor must panic")
+						}
+					}()
+					accessor()
+				})
+			}
+		})
 	}
 }
