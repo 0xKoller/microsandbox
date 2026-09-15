@@ -1047,11 +1047,14 @@ fn matches_suffix(hostname: &str, suffix: &str) -> bool {
     if hostname == suffix {
         return true;
     }
-    if hostname.len() > suffix.len() + 1 {
-        let (prefix, tail) = hostname.split_at(hostname.len() - suffix.len());
-        return prefix.ends_with('.') && tail == suffix;
-    }
-    false
+    // `strip_suffix` only splits on a char boundary. Indexing by
+    // `hostname.len() - suffix.len()` would panic on a hostname with a
+    // multi-byte char straddling that offset, and the SNI is guest input.
+    // The prefix must hold at least one label byte before its dot, so a
+    // leading-dot hostname (`.example.com`) does not match.
+    hostname
+        .strip_suffix(suffix)
+        .is_some_and(|prefix| prefix.len() > 1 && prefix.ends_with('.'))
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1220,6 +1223,38 @@ mod tests {
             ".PythonHosted.Org.".parse().unwrap(),
         ));
         assert!(egress_tcp(&policy, FILES_V4, &shared).is_allow());
+    }
+
+    #[test]
+    fn matches_suffix_label_alignment_and_multibyte_hostnames() {
+        // 14 bytes; the old byte-offset split landed inside the 3-byte
+        // U+263A and panicked. Must simply not match.
+        assert!(!matches_suffix("x\u{263A}aaaaaaaaaa", "example.com"));
+        // A multi-byte label in front of the suffix still matches.
+        assert!(matches_suffix("\u{263A}.example.com", "example.com"));
+        // Apex, subdomain, disjoint, and leading-dot forms keep their
+        // ASCII behaviour.
+        assert!(matches_suffix("example.com", "example.com"));
+        assert!(matches_suffix("a.example.com", "example.com"));
+        assert!(!matches_suffix("evilexample.com", "example.com"));
+        assert!(!matches_suffix(".example.com", "example.com"));
+    }
+
+    #[test]
+    fn suffix_rules_do_not_panic_on_multibyte_sni() {
+        let shared = shared_with_host("files.pythonhosted.org", FILES_V4);
+        let policy = allow_rule(Destination::DomainSuffix(
+            ".pythonhosted.org".parse().unwrap(),
+        ));
+        let eval = policy.evaluate_egress_with_source(
+            sock(FILES_V4, 443),
+            Protocol::Tcp,
+            &shared,
+            // 18 bytes against a 16-byte suffix: the old split at byte 2
+            // fell inside U+263A.
+            HostnameSource::Sni("x\u{263A}aaaaaaaaaaaaaa"),
+        );
+        assert_eq!(eval, EgressEvaluation::Deny);
     }
 
     #[test]
