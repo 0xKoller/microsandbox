@@ -1668,7 +1668,7 @@
         ],
         "summary": "Get sandbox metrics",
         "description": "Returns CPU, memory, disk, and network metrics for a time range.",
-        "operationId": "get_metrics",
+        "operationId": "get_sandbox_metrics",
         "parameters": [
           {
             "name": "slug",
@@ -1906,7 +1906,7 @@
           "Sandboxes"
         ],
         "summary": "List mounted volumes",
-        "operationId": "list_volumes",
+        "operationId": "list_sandbox_volumes",
         "parameters": [
           {
             "name": "slug",
@@ -2148,7 +2148,7 @@
           "Snapshots"
         ],
         "summary": "List snapshots",
-        "operationId": "list",
+        "operationId": "list_snapshots",
         "parameters": [
           {
             "name": "slug",
@@ -2273,7 +2273,7 @@
           "Snapshots"
         ],
         "summary": "Get a snapshot by name",
-        "operationId": "get_by_name",
+        "operationId": "get_snapshot_by_name",
         "parameters": [
           {
             "name": "slug",
@@ -2323,7 +2323,7 @@
           "Snapshots"
         ],
         "summary": "Delete a snapshot by name",
-        "operationId": "delete_by_name",
+        "operationId": "delete_snapshot_by_name",
         "parameters": [
           {
             "name": "slug",
@@ -2754,7 +2754,7 @@
           "Volumes"
         ],
         "summary": "List directory contents",
-        "operationId": "list",
+        "operationId": "list_directory_contents",
         "parameters": [
           {
             "name": "slug",
@@ -3484,7 +3484,7 @@
           "Volumes"
         ],
         "summary": "Get volume metrics",
-        "operationId": "get_metrics",
+        "operationId": "get_volume_metrics",
         "parameters": [
           {
             "name": "slug",

@@ -293,6 +293,43 @@ SUMMARY_OVERRIDES = {
 }
 
 
+# Stable resource-qualified IDs for handlers whose Rust names are shared.
+# The personal-token routes use the same IDs after removing their org prefix.
+OPERATION_ID_OVERRIDES = {
+    ("GET", "/v1/sandboxes/by-name/{name}"): "get_sandbox_by_name",
+    ("DELETE", "/v1/sandboxes/by-name/{name}"): "delete_sandbox_by_name",
+    ("GET", "/v1/snapshots/by-name/{name}"): "get_snapshot_by_name",
+    ("DELETE", "/v1/snapshots/by-name/{name}"): "delete_snapshot_by_name",
+    ("GET", "/v1/sandboxes/{sandbox_id}/metrics"): "get_sandbox_metrics",
+    ("GET", "/v1/volumes/{id}/metrics"): "get_volume_metrics",
+    ("GET", "/v1/sandboxes/{sandbox_id}/volumes"): "list_sandbox_volumes",
+    ("GET", "/v1/snapshots"): "list_snapshots",
+    ("GET", "/v1/volumes/{id}/files"): "list_directory_contents",
+}
+
+
+def qualify_operation_ids(paths: dict) -> None:
+    """Assign stable IDs and reject missing or duplicate IDs before publishing."""
+    seen = {}
+    for path, operations in paths.items():
+        canonical_path = path.replace("/v1/orgs/{slug}/", "/v1/", 1)
+        for method, operation in operations.items():
+            key = (method.upper(), canonical_path)
+            if key in OPERATION_ID_OVERRIDES:
+                operation["operationId"] = OPERATION_ID_OVERRIDES[key]
+            operation_id = operation.get("operationId")
+            route = f"{method.upper()} {path}"
+            if not isinstance(operation_id, str) or not operation_id.strip():
+                sys.exit(f"error: missing operationId for {route}")
+            if operation_id in seen:
+                sys.exit(
+                    f"error: duplicate operationId {operation_id!r}: "
+                    f"{seen[operation_id]} and {route}; "
+                    "assign distinct resource-qualified IDs"
+                )
+            seen[operation_id] = route
+
+
 def clean_summary(summary: str) -> str:
     """Strip the method-and-path prefix and role parentheticals upstream summaries carry."""
     s = " ".join(summary.split())
@@ -376,6 +413,8 @@ def curate(spec: dict, *, server_url: str, audience_name: str) -> dict:
             kept[method] = op
         if kept:
             paths[path] = kept
+
+    qualify_operation_ids(paths)
 
     # The shared generic must never leak into the published contract: its item
     # type is whichever instantiation utoipa registered, not the endpoint's.

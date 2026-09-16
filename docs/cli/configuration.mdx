@@ -4,14 +4,13 @@ description: Reference for root and scoped YAML files loaded by the CLI
 icon: "file-code"
 ---
 
-For how sandbox YAML fits with global configuration and explicit CLI inputs,
-start with [Configuration](/operations/configuration).
+Load reusable sandbox settings with `--conf`. See [configuration precedence](/operations/configuration#precedence) for global defaults.
 
 <Note>
 Common image, resource, lifecycle, environment, policy, secret, script, and patch fields work everywhere. Host-integrated networking, local rootfs forms, snapshots, replace behavior, and several runtime fields are unavailable on microsandbox cloud.
 </Note>
 
-Sandbox configuration is a reusable, sparse definition for one sandbox. Load it with `msb run`, `msb create`, or `msb install`; explicit CLI arguments are applied on top. The file may have any name when passed with `--conf`.
+Files may have any name and contain only the fields you need. Explicit CLI arguments override their values.
 
 ```yaml
 # sandbox.yaml
@@ -24,9 +23,15 @@ mounts:
 network:
   allow: ["api.openai.com"]
   ports: ["8000:8000"]
+secret_violation_action: block-and-log
 secrets:
   OPENAI_API_KEY:
     allow: ["api.openai.com"]
+    substitution:
+      headers: true
+      query: false
+      body: false
+    passthrough: ["telemetry.example.com"]
 scripts:
   start: "python app.py"
 ```
@@ -37,11 +42,11 @@ msb create --conf sandbox.yaml --name agent
 msb install --conf sandbox.yaml --name agent
 ```
 
-Sandbox configuration is never auto-discovered. Every root or scoped configuration file must be supplied explicitly with its corresponding flag.
+Files are never auto-discovered; pass each file explicitly.
 
 ## Sparse configuration
 
-Every config file may provide only the fields it owns. Required fields are checked after root config, scoped config, and command-line inputs are merged, so a positional image can complete a network-only file:
+Required fields are checked after merging files and CLI arguments. For example, supply the image separately from a network-only file:
 
 ```yaml
 # net-policy.yaml
@@ -61,12 +66,12 @@ If neither the files nor the arguments provide an image, the command fails befor
 
 ## Scoped config files
 
-Scoped flags accept the contents of one field or field group without its root wrapper. They are useful for focused policies that should fail on unrelated fields.
+Scoped files contain one group of settings without its wrapper key. Unrelated fields are rejected.
 
 | Flag | Accepted fields |
 | --- | --- |
 | `--conf PATH` | Any sandbox configuration field |
-| `--net-conf PATH` | `policy`, `allow`, `deny`, `ports`, `dns`, `tls`, `strict`, `trust_host_cas`, `max_connections` |
+| `--net-conf PATH` | `policy`, `allow`, `deny`, `ports`, `dns`, `tls`, `strict`, `trust_host_cas`, `max_tcp_connections`, `max_udp_connections` |
 | `--resource-conf PATH` | `cpus`, `memory`, `max_duration`, `idle_timeout`, `rlimits` |
 | `--runtime-conf PATH` | `workdir`, `shell`, `user`, `hostname`, `security`, `entrypoint`, `cmd`, `env`, `labels`, `init` |
 | `--fs-conf PATH` | `mounts`, `patch_files`, `patches` |
@@ -260,7 +265,7 @@ network:
     block_quic: true
   strict: false
   trust_host_cas: false
-  max_connections: 256
+  max_tcp_connections: 256
 ```
 
 A non-empty `allow` list implies deny-by-default egress. `strict: true` requires hostname-based allow rules to use an inspectable request authority. Plain HTTP exposes that authority in `Host`; HTTPS only exposes it when TLS interception is enabled and not bypassed. Without that visibility, strict mode denies HTTPS that would otherwise be allowed only by a hostname rule. Top-level `ports` is shorthand for `network.ports`; when both are present, the lists are combined and duplicate host ports are rejected.
@@ -276,11 +281,16 @@ secrets:
   DATABASE_URL:
     value: "${DB_DSN}"
     allow: ["db.internal"]
-    inject: [headers]
+    substitution:
+      headers: false
+      query: false
+      body: true
+    passthrough: ["audit.internal"]
+    violation_action: block-and-terminate
     require_tls_identity: true
 ```
 
-`inject` accepts `headers`, `basic_auth`, and `query_params`; it defaults to `headers`. Declaring a secret enables TLS interception and DNS-rebind protection.
+`substitution` controls headers, query parameters, and request bodies independently; it defaults to headers only, and Basic authentication follows the header setting. Disabled locations still block the placeholder unless the destination appears in `passthrough`. `secret_violation_action` sets the sandbox-wide blocking action, while a per-secret `violation_action` overrides it. Declaring a secret enables TLS interception and DNS-rebind protection.
 
 ### Scripts
 
@@ -306,3 +316,9 @@ Sandbox configuration is data, not a templating language. The loader rejects unk
 Only `${NAME}` environment substitution is supported. Substituted variables must exist when the config is loaded; an exact secret `value: "${NAME}"` is the exception because it records a host-side source that is resolved when the sandbox starts. Shell-style operators such as `${NAME:-fallback}`, includes, templates, loops, and expressions are not supported.
 
 Project envelope fields such as `sandboxes`, `volumes`, and `layers`, plus per-project fields such as `depends_on`, are rejected in single-sandbox configuration.
+
+### UDP session limit
+
+Set `max_udp_connections` in the network configuration, or pass `--max-udp-connections 512`. The default is unlimited in single-tenant mode and 1,024 relay sessions in multi-tenant mode; zero explicitly selects unlimited. At capacity, new sessions evict the least recently active session.
+
+`max_connections` and `--max-connections` remain deprecated TCP-only aliases for `max_tcp_connections` and `--max-tcp-connections`. Specifying both TCP names in one configuration or command is an error. The UDP limit is independent.

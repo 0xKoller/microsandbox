@@ -258,7 +258,7 @@
         ],
         "summary": "Get a sandbox by name",
         "description": "Retrieve one sandbox by its organization-scoped name.",
-        "operationId": "get_by_name",
+        "operationId": "get_sandbox_by_name",
         "parameters": [
           {
             "name": "name",
@@ -328,7 +328,7 @@
         ],
         "summary": "Delete a sandbox by name",
         "description": "Delete a sandbox selected by its organization-scoped name. Resource cleanup continues asynchronously.",
-        "operationId": "delete_by_name",
+        "operationId": "delete_sandbox_by_name",
         "parameters": [
           {
             "name": "name",
@@ -917,7 +917,7 @@
           "Sandboxes"
         ],
         "summary": "Get sandbox metrics",
-        "operationId": "get_metrics",
+        "operationId": "get_sandbox_metrics",
         "parameters": [
           {
             "name": "sandbox_id",
@@ -1312,7 +1312,7 @@
           "Sandboxes"
         ],
         "summary": "List mounted volumes",
-        "operationId": "list_volumes",
+        "operationId": "list_sandbox_volumes",
         "parameters": [
           {
             "name": "sandbox_id",
@@ -1600,7 +1600,7 @@
         ],
         "summary": "List snapshots",
         "description": "List the organization's managed disk snapshots.",
-        "operationId": "list",
+        "operationId": "list_snapshots",
         "parameters": [
           {
             "name": "cursor",
@@ -1778,7 +1778,7 @@
         ],
         "summary": "Get a snapshot by name",
         "description": "Retrieve a managed disk snapshot by its organization-unique name.",
-        "operationId": "get_by_name",
+        "operationId": "get_snapshot_by_name",
         "parameters": [
           {
             "name": "name",
@@ -1848,7 +1848,7 @@
         ],
         "summary": "Delete a snapshot by name",
         "description": "Delete a managed disk snapshot by its organization-unique name.",
-        "operationId": "delete_by_name",
+        "operationId": "delete_snapshot_by_name",
         "parameters": [
           {
             "name": "name",
@@ -2454,7 +2454,7 @@
           "Volumes"
         ],
         "summary": "List directory contents",
-        "operationId": "list",
+        "operationId": "list_directory_contents",
         "parameters": [
           {
             "name": "id",
@@ -3600,7 +3600,7 @@
           "Volumes"
         ],
         "summary": "Get volume metrics",
-        "operationId": "get_metrics",
+        "operationId": "get_volume_metrics",
         "parameters": [
           {
             "name": "id",
