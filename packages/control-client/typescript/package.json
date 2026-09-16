@@ -1,6 +1,6 @@
 {
   "name": "@microsandbox/control-client",
-  "version": "0.6.18",
+  "version": "0.7.0",
   "type": "module",
   "license": "Apache-2.0",
   "engines": { "node": ">=22" },
@@ -15,8 +15,8 @@
     "test": "vitest run tests --no-file-parallelism"
   },
   "dependencies": {
-    "@microsandbox/protocol-client": "0.6.18",
-    "@microsandbox/types": "0.6.18"
+    "@microsandbox/protocol-client": "0.7.0",
+    "@microsandbox/types": "0.7.0"
   },
   "devDependencies": {
     "@types/node": "^25.5.2",

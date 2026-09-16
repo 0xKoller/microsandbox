@@ -31,6 +31,8 @@
 #     TypeScript example)
 #   - sdk/go/setup.go (sdkVersion constant; consumed by FFI bootstrap to
 #     name the per-version cache directory for libmicrosandbox_go_ffi)
+#   - sdk/ruby/lib/microsandbox/version.rb (gem version; the extension's
+#     Cargo manifest and exact Rust SDK pin are covered by the Rust step)
 #
 # Cargo.lock entries for workspace-versioned crates are bumped by sed,
 # but the script does not do a full cargo-driven regen — run `cargo
@@ -164,6 +166,15 @@ GO_SETUP="sdk/go/setup.go"
 if [ -f "$GO_SETUP" ] && grep -q "sdkVersion = \"${OLD}\"" "$GO_SETUP"; then
   inplace "s/sdkVersion = \"${OLD}\"/sdkVersion = \"${NEW}\"/" "$GO_SETUP"
   echo "  updated ${GO_SETUP}"
+fi
+
+# --- Ruby: gem version constant -----------------------------------------
+# The gemspec reads this separately from Cargo; both must match the exact
+# Rust SDK requirement checked by `rake version_check`.
+RUBY_VERSION_FILE="sdk/ruby/lib/microsandbox/version.rb"
+if [ -f "$RUBY_VERSION_FILE" ] && grep -Fq "VERSION = \"${OLD}\"" "$RUBY_VERSION_FILE"; then
+  inplace "s/VERSION = \"${OLD//./\\.}\"/VERSION = \"${NEW}\"/" "$RUBY_VERSION_FILE"
+  echo "  updated ${RUBY_VERSION_FILE}"
 fi
 
 echo
