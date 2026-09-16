@@ -25,7 +25,7 @@ Network(
     ipv6_pool: str | None = None,
     max_tcp_connections: int | None = None,
     max_udp_connections: int | None = None,
-    on_secret_violation: ViolationAction | ViolationPolicy = ViolationAction.BLOCK_AND_LOG,
+    secret_violation_action: ViolationAction = ViolationAction.BLOCK_AND_LOG,
 )
 ```
 
@@ -93,7 +93,17 @@ IPv6 pool used for per-sandbox `/64` guest prefixes. Defaults to `fd42:6d73:62::
 
 `int \| None` · Default: `None`
 
-Maximum concurrent connections
+Maximum concurrent TCP connections. Zero selects unlimited.
+
+The same limits can be selected when restoring, without changing the captured guest interface:
+
+```python
+restored = await Sandbox.restore(
+    "saved", name="child", max_tcp_connections=64, max_udp_connections=128,
+)
+```
+
+Omitted restore limits use destination defaults. `restore_with_progress()` accepts the same options; `max_connections` remains a deprecated TCP-only alias, and supplying both TCP names is an error.
 
 #### <span className="msb-recv">network.</span><span className="msb-hn">rate_limiter</span>
 
@@ -103,9 +113,9 @@ Maximum concurrent connections
 
 Ingress and egress rate limits
 
-#### <span className="msb-recv">network.</span><span className="msb-hn">on_secret_violation</span>
+#### <span className="msb-recv">network.</span><span className="msb-hn">secret_violation_action</span>
 
-[`ViolationAction`](/sdk/python/secrets#violationaction)` \| `[`ViolationPolicy`](/sdk/python/secrets#violationpolicy) · Default: `BLOCK_AND_LOG`
+[`ViolationAction`](/sdk/python/secrets#violationaction) · Default: `BLOCK_AND_LOG`
 
 Sandbox-wide action when a secret placeholder reaches a disallowed host
 

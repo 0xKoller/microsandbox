@@ -5,6 +5,7 @@ fn assert_same_type<T: 'static, U: 'static>() {
 }
 
 #[test]
+#[cfg(feature = "engine")]
 fn legacy_module_paths_alias_canonical_modules() {
     assert_same_type::<
         microsandbox_network::backend::SmoltcpBackend,
@@ -48,6 +49,12 @@ fn legacy_module_paths_alias_canonical_modules() {
 }
 
 #[test]
+fn tls_config_path_remains_available_without_the_engine() {
+    assert_same_type::<microsandbox_network::tls::TlsConfig, microsandbox_types::TlsConfig>();
+}
+
+#[test]
+#[cfg(feature = "engine")]
 #[allow(deprecated)]
 fn deprecated_tracker_names_remain_source_compatible() {
     assert_same_type::<

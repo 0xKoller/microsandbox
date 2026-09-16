@@ -24,6 +24,7 @@ export type { DeploymentProfile } from "./deployment-profile.js";
 
 // Sandbox lifecycle and execution
 export { PullProgressCreate, Sandbox, SandboxListBuilder } from "./sandbox.js";
+export type { RestoreBuilder } from "./sandbox.js";
 import { Sandbox as _Sandbox, type SandboxBuilder as _SBT } from "./sandbox.js";
 /**
  * Native fluent builder for a sandbox. `new SandboxBuilder(name)` is
@@ -44,6 +45,8 @@ export type {
   SandboxPage,
   SandboxPingResult,
   SandboxTouchResult,
+  ExternalMountWarning,
+  BranchOutcome,
 } from "./sandbox.js";
 export type {
   ChangeKind,
@@ -104,7 +107,8 @@ export {
 } from "./volume-fs.js";
 
 // Snapshots
-export { Snapshot } from "./snapshot.js";
+export { Snapshot, SnapshotArchive } from "./snapshot.js";
+export type { DiskCompactionOptions, DiskCompactionDiskResult, DiskCompactionResult } from "./compact.js";
 import { Snapshot as _Snapshot, type SnapshotBuilder as _SnapBT } from "./snapshot.js";
 /**
  * Native fluent builder for a snapshot. `new SnapshotBuilder(name)`
@@ -112,14 +116,16 @@ import { Snapshot as _Snapshot, type SnapshotBuilder as _SnapBT } from "./snapsh
  */
 export const SnapshotBuilder = function SnapshotBuilder(
   this: unknown,
-  name: string,
+  name = "",
 ) {
   return _Snapshot.builder(name);
-} as unknown as new (name: string) => _SnapBT;
+} as unknown as new (name?: string) => _SnapBT;
 export type SnapshotBuilder = _SnapBT;
 export { SnapshotHandle } from "./snapshot-handle.js";
 export type {
   SaveOpts,
+  LoadOpts,
+  HeadUpdate,
   SnapshotCopyBuilder,
   SnapshotScope,
   SnapshotState,
@@ -255,6 +261,8 @@ function hideMethod(cls: { prototype: Record<string, unknown> }, name: string): 
 hideMethod(napi.NetworkBuilder, "buildJson");
 hideMethod(napi.NetworkBuilder, "policyJson");
 hideMethod(napi.NetworkBuilder, "policyFromBuilder");
+hideMethod(napi.RestoreBuilder, "networkPolicyJson");
+hideMethod(napi.RestoreBuilder, "networkPolicyFromBuilder");
 hideMethod(napi.SandboxBuilder, "execWithBuilder");
 hideMethod(napi.SandboxBuilder, "execStreamWithBuilder");
 hideMethod(napi.SandboxBuilder, "attachWithBuilder");
@@ -369,6 +377,18 @@ hideMethod(napi.SandboxBuilder, "attachWithBuilder");
       return this;
     };
   }
+  // Restore shares policy conversion, but never exposes the broad NetworkBuilder callback.
+  const restoreProto = napi.RestoreBuilder.prototype;
+  if (!restoreProto.networkPolicy) {
+    restoreProto.networkPolicy = function (p: unknown) {
+      if (p instanceof napi.NetworkPolicyBuilder) {
+        this.networkPolicyFromBuilder(p);
+      } else {
+        this.networkPolicyJson(JSON.stringify(remapKeys(p)));
+      }
+      return this;
+    };
+  }
 }
 
 export const DnsBuilder = napi.DnsBuilder;
@@ -423,7 +443,8 @@ export type PullProgressEvent = NapiPullProgressEvent;
 export type PullProgressStream = NapiPullProgressStream;
 
 // Setup + module-level helpers
-export { Setup, install, isInstalled, setup } from "./setup.js";
+export { resolveRuntimeVersion, resolveRuntime, isRuntimeInstalled, installRuntime, ensureRuntime } from "./setup.js";
+export type { RuntimeConfig, InstallOptions, ResolvedRuntime, RuntimeOrigin } from "./setup.js";
 export { allSandboxMetrics } from "./all-metrics.js";
 
 /** Override the `libkrunfw` shared library path used by subsequently created local sandboxes. */
@@ -441,6 +462,7 @@ export {
   CloudHttpError,
   DatabaseError,
   ExecTimeoutError,
+  StopTimeoutError,
   HttpError,
   ImageError,
   ImageInUseError,
@@ -457,6 +479,8 @@ export {
   PatchFailedError,
   ProtocolError,
   RuntimeError,
+  RuntimeIncompleteError,
+  RuntimeNotInstalledError,
   SandboxFsOpsError,
   SandboxAlreadyExistsError,
   SandboxNotFoundError,
@@ -464,13 +488,18 @@ export {
   SandboxStopTimedOutError,
   SandboxReplacedError,
   SandboxStillRunningError,
+  SnapshotSourceRecoveryError,
   TerminalError,
   UnsupportedOperationError,
   UnsupportedError,
   VolumeAlreadyExistsError,
   VolumeNotFoundError,
 } from "./errors.js";
-export type { MicrosandboxErrorCode } from "./errors.js";
+export type {
+  MicrosandboxErrorCode,
+  PublishedSnapshotArtifact,
+  SnapshotSourceRecoveryDetails,
+} from "./errors.js";
 
 // Sizes
 export { GiB, KiB, MiB, TiB } from "./size.js";
@@ -510,10 +539,12 @@ export type {
 // consistent with what each other native builder emits (TlsConfig /
 // DnsConfig / SecretEntry / VolumeMount / Patch — all flat shapes
 // with `kind` discriminator + per-variant fields).
-export type VolumeMountKind = "bind" | "named" | "tmpfs" | "disk";
+export type { NapiOwnedVolumeOptions as OwnedVolumeOptions } from "./internal/napi.js";
+export type VolumeMountKind = "bind" | "named" | "owned" | "tmpfs" | "disk";
 export const VolumeMountKinds: readonly VolumeMountKind[] = [
   "bind",
   "named",
+  "owned",
   "tmpfs",
   "disk",
 ] as const;
@@ -558,6 +589,8 @@ export type { SandboxMetrics } from "./metrics.js";
 
 // Pull progress
 export type { PullProgress } from "./pull-progress.js";
+export { CreationProgressCreate } from "./sandbox.js";
+export type { CreationProgress, CreationProgressStream, StartupPhase } from "./creation-progress.js";
 
 // Network policy
 export { ViolationActions } from "./violation-action.js";
