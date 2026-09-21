@@ -912,9 +912,7 @@ impl SandboxBuilder {
         match self.local_network_config() {
             Ok(mut network) => {
                 network.secrets.secrets.push(entry);
-                if !network.tls.enabled {
-                    network.tls.enabled = true;
-                }
+                super::config::ensure_tls_for_secrets(&mut network);
                 if let Err(err) = self.set_local_network_config(network)
                     && self.build_error.is_none()
                 {

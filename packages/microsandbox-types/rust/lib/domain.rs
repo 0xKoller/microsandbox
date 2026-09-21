@@ -2485,6 +2485,18 @@ pub enum SecretConfigError {
 }
 
 impl SecretsConfig {
+    /// Whether any configured secret requires verified TLS identity.
+    pub fn has_tls_identity_secrets(&self) -> bool {
+        self.secrets
+            .iter()
+            .any(|secret| secret.require_tls_identity)
+    }
+
+    /// Whether a secret is configured for the given environment variable.
+    pub fn contains_env_var(&self, env_var: &str) -> bool {
+        self.secrets.iter().any(|secret| secret.env_var == env_var)
+    }
+
     /// Validate all configured secret entries.
     pub fn validate(&self) -> Result<(), SecretConfigError> {
         for (index, secret) in self.secrets.iter().enumerate() {
@@ -3122,6 +3134,20 @@ impl fmt::Display for NetworkRateLimitDirection {
 mod tests {
     use super::*;
 
+    fn secret_entry(env_var: &str, require_tls_identity: bool) -> SecretEntry {
+        SecretEntry {
+            env_var: env_var.to_owned(),
+            value: Zeroizing::new("secret".to_owned()),
+            source: None,
+            placeholder: format!("$MSB_{env_var}"),
+            allowed_hosts: vec![HostPattern::Any],
+            substitution: SecretSubstitution::default(),
+            passthrough_hosts: Vec::new(),
+            violation_action: None,
+            require_tls_identity,
+        }
+    }
+
     fn tmpfs_mount(guest: &str) -> VolumeMount {
         VolumeMount::Tmpfs {
             guest: guest.to_owned(),
@@ -3155,6 +3181,21 @@ mod tests {
             mounts.iter().map(VolumeMount::guest).collect::<Vec<_>>(),
             vec!["/workspace", "/alpha/z", "/workspace/persist/logs"]
         );
+    }
+
+    #[test]
+    fn secrets_config_queries_entries() {
+        let mut config = SecretsConfig {
+            secrets: vec![secret_entry("HTTP_TOKEN", false)],
+            violation_action: SecretViolationAction::default(),
+        };
+
+        assert!(!config.has_tls_identity_secrets());
+        assert!(config.contains_env_var("HTTP_TOKEN"));
+        assert!(!config.contains_env_var("MISSING"));
+
+        config.secrets.push(secret_entry("API_KEY", true));
+        assert!(config.has_tls_identity_secrets());
     }
 
     #[test]
