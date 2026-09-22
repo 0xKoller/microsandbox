@@ -10,9 +10,9 @@ use microsandbox_network::policy::NetworkPolicy as RustNetworkPolicy;
 use crate::dns_builder::JsDnsBuilder;
 use crate::interface_overrides_builder::JsInterfaceOverridesBuilder;
 use crate::network_policy_builder::JsNetworkPolicyBuilder;
-use crate::secret_builder::JsSecretBuilder;
+use crate::rate_limiter_builder::{JsNetworkRateLimiterBuilder, RateLimiterValues};
+use crate::secret_builder::{JsSecretBuilder, parse_violation_action};
 use crate::tls_builder::JsTlsBuilder;
-use crate::violation_action_builder::JsViolationActionBuilder;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -221,29 +221,45 @@ impl JsNetworkBuilder {
         Ok(self)
     }
 
-    /// Configure the violation action for secrets.
-    #[napi(js_name = "onSecretViolation")]
-    pub fn on_secret_violation(
-        &mut self,
-        env: &Env,
-        configure: Function<
-            ClassInstance<JsViolationActionBuilder>,
-            ClassInstance<JsViolationActionBuilder>,
-        >,
-    ) -> Result<&Self> {
-        let initial = JsViolationActionBuilder::new().into_instance(env)?;
-        let mut returned = configure.call(initial)?;
-        let violation_builder = returned.take_inner_builder()?;
+    /// Configure the default blocking action for secret placeholders.
+    #[napi(js_name = "secretViolationAction")]
+    pub fn secret_violation_action(&mut self, action: String) -> Result<&Self> {
+        let action = parse_violation_action(&action)?;
         let prev = self.take_inner();
-        self.inner = Some(prev.on_secret_violation(|_default| violation_builder));
+        self.inner = Some(prev.secret_violation_action(action));
         Ok(self)
     }
 
-    /// Set the maximum number of concurrent connections.
+    /// @deprecated Use maxTcpConnections instead.
+    #[allow(deprecated)]
     #[napi(js_name = "maxConnections")]
     pub fn max_connections(&mut self, max: u32) -> &Self {
         let prev = self.take_inner();
         self.inner = Some(prev.max_connections(max as usize));
+        self
+    }
+
+    /// Set the TCP connection cap; zero selects unlimited.
+    #[napi(js_name = "maxTcpConnections")]
+    pub fn max_tcp_connections(&mut self, max: u32) -> &Self {
+        let prev = self.take_inner();
+        self.inner = Some(prev.max_tcp_connections(max as usize));
+        self
+    }
+
+    /// Set the UDP session cap; zero selects unlimited. Defaults to unlimited for single-tenant and 1024 for multi-tenant.
+    #[napi(js_name = "maxUdpConnections")]
+    pub fn max_udp_connections(&mut self, max: u32) -> &Self {
+        let prev = self.take_inner();
+        self.inner = Some(prev.max_udp_connections(max as usize));
+        self
+    }
+
+    /// Require hostname-based policy allows to use inspectable application authority.
+    #[napi]
+    pub fn strict(&mut self, enabled: bool) -> &Self {
+        let prev = self.take_inner();
+        self.inner = Some(prev.strict(enabled));
         self
     }
 
@@ -275,6 +291,39 @@ impl JsNetworkBuilder {
         self
     }
 
+    /// Configure local egress and ingress rate limits. Applies on the next
+    /// sandbox start.
+    ///
+    /// ```js
+    /// .rateLimiter((r) => r
+    ///   .egress((r) => r
+    ///     .bandwidth(1_048_576, 1_000)
+    ///     .ops(1_000, 1_000)))
+    /// ```
+    #[napi(js_name = "rateLimiter")]
+    pub fn rate_limiter(
+        &mut self,
+        env: &Env,
+        configure: Function<
+            ClassInstance<JsNetworkRateLimiterBuilder>,
+            ClassInstance<JsNetworkRateLimiterBuilder>,
+        >,
+    ) -> Result<&Self> {
+        let initial = JsNetworkRateLimiterBuilder::new().into_instance(env)?;
+        let returned = configure.call(initial)?;
+        let prev = self.take_inner();
+        self.inner = Some(prev.rate_limiter(|mut r| {
+            if let Some(ref limiter) = returned.egress {
+                r = r.egress(|direction| apply_rate_limiter(direction, limiter));
+            }
+            if let Some(ref limiter) = returned.ingress {
+                r = r.ingress(|direction| apply_rate_limiter(direction, limiter));
+            }
+            r
+        }));
+        Ok(self)
+    }
+
     /// Snapshot the accumulated configuration as a JSON string. The TS
     /// layer parses + key-remaps to camelCase before returning to the
     /// caller.
@@ -296,6 +345,27 @@ impl JsNetworkBuilder {
 fn parse_bind_addr(bind: &str) -> Result<IpAddr> {
     bind.parse::<IpAddr>()
         .map_err(|_| napi::Error::from_reason(format!("invalid bind address: {bind}")))
+}
+
+/// Apply the values a JS callback accumulated on a `RateLimiterBuilder`
+/// to the Rust builder. Validation happens in `NetworkBuilder.build()`.
+fn apply_rate_limiter(
+    mut r: microsandbox_network::builder::RateLimiterBuilder,
+    js: &RateLimiterValues,
+) -> microsandbox_network::builder::RateLimiterBuilder {
+    if let Some((size_bytes, refill_time_ms)) = js.bandwidth {
+        r = r.bandwidth(size_bytes, std::time::Duration::from_millis(refill_time_ms));
+    }
+    if let Some(burst) = js.bandwidth_burst {
+        r = r.bandwidth_burst(burst);
+    }
+    if let Some((count, refill_time_ms)) = js.ops {
+        r = r.ops(count, std::time::Duration::from_millis(refill_time_ms));
+    }
+    if let Some(burst) = js.ops_burst {
+        r = r.ops_burst(burst);
+    }
+    r
 }
 
 impl JsNetworkBuilder {

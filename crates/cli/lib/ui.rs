@@ -471,6 +471,32 @@ pub fn parse_size_mib(s: &str) -> Result<u32, String> {
     }
 }
 
+/// Parse a byte-precision size string: raw bytes plus binary `K`, `M`,
+/// and `G` suffixes (e.g. `1048576`, `512K`, `1M`, `2G`).
+///
+/// The whole-byte sibling of [`parse_size_mib`], for values (like network
+/// rate limit buckets) that need finer than MiB granularity.
+pub fn parse_size_bytes(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (digits, multiplier) = if let Some(n) = s.strip_suffix('K').or_else(|| s.strip_suffix('k'))
+    {
+        (n, 1024u64)
+    } else if let Some(n) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
+        (n, 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
+        (n, 1024 * 1024 * 1024)
+    } else {
+        (s, 1)
+    };
+    let value: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid size `{s}` (expected raw bytes or K/M/G suffix): {e}"))?;
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("size `{s}` overflows u64 bytes"))
+}
+
 /// Parse an environment variable specification (KEY=value or KEY).
 pub fn parse_env(s: &str) -> Result<(String, String), String> {
     if let Some(eq_pos) = s.find('=') {
@@ -522,42 +548,6 @@ pub fn format_rfc3339_datetime(s: &str) -> Result<String, chrono::ParseError> {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Tests
-//--------------------------------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn json_datetime_uses_rfc3339_utc() {
-        let dt = chrono::DateTime::parse_from_rfc3339("2026-05-31T09:09:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-
-        assert_eq!(
-            super::format_json_datetime(&dt),
-            "2026-05-31T09:09:00+00:00"
-        );
-    }
-
-    #[test]
-    fn display_datetime_uses_local_timezone() {
-        let dt = chrono::DateTime::parse_from_rfc3339("2026-05-31T09:09:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let expected = dt
-            .with_timezone(&chrono::Local)
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-
-        assert_eq!(super::format_datetime(&dt), expected);
-        assert_eq!(
-            super::format_rfc3339_datetime("2026-05-31T09:09:00Z").unwrap(),
-            expected
-        );
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
 // Types: Pull Progress Display
 //--------------------------------------------------------------------------------------------------
 
@@ -582,6 +572,37 @@ pub struct PullProgressDisplay {
 //--------------------------------------------------------------------------------------------------
 
 impl PullProgressDisplay {
+    /// Render creation telemetry using the existing stderr-only progress surface.
+    pub fn handle_creation_event(&mut self, event: microsandbox::CreationProgress) {
+        use microsandbox::{CreationProgress, StartupPhase};
+        match event {
+            CreationProgress::Pull(event) => self.handle_event(event),
+            CreationProgress::Startup(event) => {
+                let phase = match event.phase {
+                    StartupPhase::PreparingSnapshot => "Preparing sandbox",
+                    StartupPhase::WaitingForMemoryBacking => "Waiting for RAM backing",
+                    StartupPhase::PreparingMemoryBacking => "Preparing RAM backing",
+                    StartupPhase::ReusingMemoryBacking => "Reusing RAM backing",
+                    StartupPhase::SyncingMemoryBacking => "Syncing RAM backing",
+                    StartupPhase::Activating => "Activating sandbox",
+                };
+                // No invented percentage during a lock wait or fsync. Byte counts apply only
+                // to verified slices actually written, not the VM's hotplug ceiling.
+                let detail = event
+                    .total_bytes
+                    .map(|total| {
+                        format!(
+                            " — {} / {} MiB",
+                            event.completed_bytes / 1_048_576,
+                            total / 1_048_576
+                        )
+                    })
+                    .unwrap_or_default();
+                self.header.set_message(format!("{phase}{detail}"));
+            }
+        }
+    }
+
     /// Create a new pull progress display for the given image reference.
     pub fn new(reference: &str) -> Self {
         Self::new_inner(reference, false, "Pulling")
@@ -772,5 +793,60 @@ impl PullProgressDisplay {
     /// Clear all ephemeral progress output from the terminal.
     pub fn finish(self) {
         let _ = self.mp.clear();
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parse_size_bytes_accepts_raw_bytes_and_binary_suffixes() {
+        assert_eq!(super::parse_size_bytes("1048576").unwrap(), 1024 * 1024);
+        assert_eq!(super::parse_size_bytes("512K").unwrap(), 512 * 1024);
+        assert_eq!(super::parse_size_bytes("1M").unwrap(), 1024 * 1024);
+        assert_eq!(
+            super::parse_size_bytes("2G").unwrap(),
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            super::parse_size_bytes("2g").unwrap(),
+            2 * 1024 * 1024 * 1024
+        );
+
+        assert!(super::parse_size_bytes("1.5M").is_err());
+        assert!(super::parse_size_bytes("abc").is_err());
+        assert!(super::parse_size_bytes(&format!("{}G", u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn json_datetime_uses_rfc3339_utc() {
+        let dt = chrono::DateTime::parse_from_rfc3339("2026-05-31T09:09:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(
+            super::format_json_datetime(&dt),
+            "2026-05-31T09:09:00+00:00"
+        );
+    }
+
+    #[test]
+    fn display_datetime_uses_local_timezone() {
+        let dt = chrono::DateTime::parse_from_rfc3339("2026-05-31T09:09:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let expected = dt
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        assert_eq!(super::format_datetime(&dt), expected);
+        assert_eq!(
+            super::format_rfc3339_datetime("2026-05-31T09:09:00Z").unwrap(),
+            expected
+        );
     }
 }
