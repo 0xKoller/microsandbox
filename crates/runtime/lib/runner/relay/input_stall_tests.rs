@@ -8,6 +8,14 @@ use super::*;
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+async fn assert_pending_once<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) {
+    std::future::poll_fn(|cx| {
+        assert!(future.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+}
+
 fn blocked_write(shared: Arc<ConsoleSharedState>) -> tokio::task::JoinHandle<bool> {
     tokio::spawn(async move {
         #[cfg(unix)]
@@ -193,4 +201,341 @@ async fn input_stall_admission_gate_preserves_existing_client_output() {
     })
     .await
     .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn input_stall_private_write_preserves_clock_stall_until_delivery() {
+    let shared = Arc::new(ConsoleSharedState::with_capacity(4096));
+    shared.rx_ring.push(Bytes::from(vec![0; 4096])).unwrap();
+    let (tx, rx) = ControlWriter::new();
+    tx.send(ControlWrite::clock_sync().unwrap()).await.unwrap();
+
+    let mut health = shared.input_stalled.subscribe();
+    let writer = tokio::spawn(ring_writer_task(Arc::clone(&shared), rx));
+    health.wait_for(|stalled| *stalled).await.unwrap();
+    health.borrow_and_update();
+
+    let control = Arc::clone(&shared.workload_control);
+    let request = tokio::spawn(async move {
+        control
+            .request(
+                Message::with_payload(
+                    MessageType::WorkloadFreeze,
+                    0,
+                    &microsandbox_protocol::core::WorkloadFreeze {
+                        external_mount_tags: Vec::new(),
+                        attempt_id: "stall".into(),
+                        host_input: Default::default(),
+                    },
+                )
+                .unwrap(),
+                "stall",
+            )
+            .await
+    });
+
+    // The clock checks capacity before pushing. A failed push proves the private
+    // write has taken over the blocked delivery, rather than merely been queued.
+    for _ in 0..100 {
+        if shared.rx_ring.snapshot().full_events > 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    assert!(shared.rx_ring.snapshot().full_events > 0);
+    assert!(
+        *health.borrow(),
+        "private traffic must not reopen admission"
+    );
+    assert!(
+        !health.has_changed().unwrap(),
+        "no false recovery notification"
+    );
+
+    drop(shared.rx_ring.pop());
+    shared.rx_capacity_wake.wake();
+    health.wait_for(|stalled| !*stalled).await.unwrap();
+
+    let delivered = shared.rx_ring.pop().unwrap();
+    assert_eq!(
+        decode_frame(&delivered).unwrap().t,
+        MessageType::WorkloadFreeze
+    );
+    drop(delivered);
+
+    shared.close();
+    writer.await.unwrap().unwrap();
+    assert!(request.await.unwrap().is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn input_stall_freeze_preserves_admission_gate_until_delivery() {
+    let shared = Arc::new(ConsoleSharedState::with_capacity(4096));
+    shared.rx_ring.push(Bytes::from(vec![0; 4096])).unwrap();
+    let (tx, rx) = ControlWriter::new();
+    tx.send(ControlWrite::clock_sync().unwrap()).await.unwrap();
+
+    let mut health = shared.input_stalled.subscribe();
+    let writer = tokio::spawn(ring_writer_task(Arc::clone(&shared), rx));
+    health.wait_for(|stalled| *stalled).await.unwrap();
+    health.borrow_and_update();
+
+    for _ in 0..3 {
+        let gate = shared.workload_control.gate();
+        shared.workload_control.parked_position().await.unwrap();
+        tokio::time::advance(Duration::from_secs(3600)).await;
+
+        assert!(*health.borrow(), "freezing must not reopen admission");
+        assert!(
+            !health.has_changed().unwrap(),
+            "no recovery without delivery"
+        );
+
+        gate.release();
+        tokio::task::yield_now().await;
+        assert!(*health.borrow(), "thaw must not restart the stall deadline");
+    }
+
+    drop(shared.rx_ring.pop());
+    shared.rx_capacity_wake.wake();
+    health.wait_for(|stalled| !*stalled).await.unwrap();
+
+    let delivered = shared.rx_ring.pop().unwrap();
+    assert_eq!(decode_frame(&delivered).unwrap().t, MessageType::ClockSync);
+    drop(delivered);
+
+    shared.close();
+    writer.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn input_stall_completion_paths_preserve_errors_during_shutdown() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for lane in ["reader", "writer", "bulk"] {
+            for outcome in ["clean", "error", "panic"] {
+                // Bulk reports RuntimeResult through a channel, not a JoinHandle.
+                if lane == "bulk" && outcome == "panic" {
+                    continue;
+                }
+
+                for shutdown_mode in ["active", "signalled", "dropped"] {
+                    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+                    let (bulk_tx, mut bulk_rx) = mpsc::channel(1);
+                    let result = move || match outcome {
+                        "clean" => Ok(()),
+                        "error" => Err(RuntimeError::Custom("injected lane failure".into())),
+                        _ => panic!("injected lane panic"),
+                    };
+
+                    let mut reader = tokio::spawn(std::future::pending::<RuntimeResult<()>>());
+                    let mut writer = tokio::spawn(std::future::pending::<RuntimeResult<()>>());
+
+                    if lane == "bulk" {
+                        bulk_tx.send(result()).await.unwrap();
+                    } else {
+                        let handle = if lane == "reader" {
+                            &mut reader
+                        } else {
+                            &mut writer
+                        };
+                        handle.abort();
+                        let _ = (&mut *handle).await;
+                        *handle = tokio::spawn(async move { result() });
+
+                        // Observe actual task completion before making shutdown ready.
+                        // The other handles remain pending, so this exact arm must win.
+                        while !handle.is_finished() {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+
+                    match shutdown_mode {
+                        "signalled" => {
+                            shutdown_tx.send_replace(true);
+                        }
+                        "dropped" => drop(shutdown_tx),
+                        _ => {}
+                    }
+
+                    let exit =
+                        wait_relay_exit(&mut reader, &mut writer, &mut bulk_rx, &mut shutdown_rx)
+                            .await;
+                    let context = format!("{lane}, {outcome}, {shutdown_mode}");
+
+                    assert_eq!(exit.control_writer_usable, lane != "writer", "{context}");
+                    assert_eq!(
+                        exit.can_observe_failure_terminals,
+                        lane == "bulk",
+                        "{context}"
+                    );
+
+                    if outcome == "clean" && shutdown_mode != "active" {
+                        assert!(exit.failure.is_none(), "{context}: {:?}", exit.failure);
+                    } else {
+                        let error = exit
+                            .failure
+                            .unwrap_or_else(|| panic!("lost failure: {context}"));
+                        let expected = match outcome {
+                            "clean" => "stopped unexpectedly",
+                            "error" => "injected lane failure",
+                            _ => "task failed",
+                        };
+                        assert!(error.to_string().contains(expected), "{context}: {error}");
+                    }
+
+                    reader.abort();
+                    writer.abort();
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn input_stall_countdown_excludes_paused_time_without_resetting() {
+    let shared = Arc::new(ConsoleSharedState::with_capacity(4096));
+    shared.rx_ring.push(Bytes::from(vec![0; 4096])).unwrap();
+    let (tx, rx) = ControlWriter::new();
+    tx.send(ControlWrite::clock_sync().unwrap()).await.unwrap();
+    let writer = ring_writer_task(Arc::clone(&shared), rx);
+    tokio::pin!(writer);
+
+    // Poll the real scheduler directly so each time advance starts only after
+    // it has observed the gate transition and armed or suspended its timer.
+    assert_pending_once(writer.as_mut()).await;
+
+    for _ in 0..2 {
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let gate = shared.workload_control.gate();
+
+        assert_pending_once(writer.as_mut()).await;
+        shared.workload_control.parked_position().await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert_pending_once(writer.as_mut()).await;
+        assert!(
+            !input_is_stalled(&shared, None),
+            "intentional pause is not a stall"
+        );
+
+        gate.release();
+        assert_pending_once(writer.as_mut()).await;
+    }
+
+    // Forty seconds of actual blockage have elapsed. Only twenty remain,
+    // regardless of the two hours spent parked or the number of gate changes.
+    tokio::time::advance(Duration::from_secs(19)).await;
+    assert_pending_once(writer.as_mut()).await;
+    assert!(!input_is_stalled(&shared, None));
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_pending_once(writer.as_mut()).await;
+    assert!(
+        input_is_stalled(&shared, None),
+        "resume must not restart the countdown"
+    );
+
+    shared.close();
+    writer.await.unwrap();
+    assert!(!input_is_stalled(&shared, None));
+}
+
+#[tokio::test]
+async fn input_stall_shutdown_without_task_completion_ignores_false_updates() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for drop_sender in [false, true] {
+            let mut reader = tokio::spawn(std::future::pending::<RuntimeResult<()>>());
+            let mut writer = tokio::spawn(std::future::pending::<RuntimeResult<()>>());
+            let reader_abort = reader.abort_handle();
+            let writer_abort = writer.abort_handle();
+            let (_bulk_tx, mut bulk_rx) = mpsc::channel(1);
+            let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+            let exit = wait_relay_exit(&mut reader, &mut writer, &mut bulk_rx, &mut shutdown_rx);
+            tokio::pin!(exit);
+
+            assert_pending_once(exit.as_mut()).await;
+
+            shutdown_tx.send_replace(false);
+            std::future::poll_fn(|cx| {
+                assert!(
+                    std::future::Future::poll(exit.as_mut(), cx).is_pending(),
+                    "a false update must leave the relay running"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+
+            if drop_sender {
+                drop(shutdown_tx);
+            } else {
+                shutdown_tx.send_replace(true);
+            }
+
+            let result = exit.await;
+            assert!(result.failure.is_none());
+            assert!(!result.control_writer_usable);
+            assert!(!result.can_observe_failure_terminals);
+
+            reader_abort.abort();
+            writer_abort.abort();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn input_stall_private_delivery_resumes_a_suspended_countdown() {
+    let shared = Arc::new(ConsoleSharedState::with_capacity(4096));
+    shared.rx_ring.push(Bytes::from(vec![0; 4096])).unwrap();
+    let (tx, rx) = ControlWriter::new();
+    tx.send(ControlWrite::clock_sync().unwrap()).await.unwrap();
+    let writer = ring_writer_task(Arc::clone(&shared), rx);
+    tokio::pin!(writer);
+    assert_pending_once(writer.as_mut()).await;
+
+    tokio::time::advance(Duration::from_secs(20)).await;
+    let _gate = shared.workload_control.gate();
+    assert_pending_once(writer.as_mut()).await;
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    assert_pending_once(writer.as_mut()).await;
+    assert!(!input_is_stalled(&shared, None));
+
+    let message = Message::with_payload(
+        MessageType::WorkloadFreeze,
+        0,
+        &microsandbox_protocol::core::WorkloadFreeze {
+            external_mount_tags: Vec::new(),
+            attempt_id: "paused".into(),
+            host_input: Default::default(),
+        },
+    )
+    .unwrap();
+    let request = shared.workload_control.request(message, "paused");
+    tokio::pin!(request);
+    assert_pending_once(request.as_mut()).await;
+    assert_pending_once(writer.as_mut()).await;
+    assert!(shared.rx_ring.snapshot().full_events > 0);
+
+    // Private lifecycle delivery is allowed through the gate, so its blocked
+    // push resumes the remaining forty seconds instead of staying suspended.
+    tokio::time::advance(Duration::from_secs(39)).await;
+    assert_pending_once(writer.as_mut()).await;
+    assert!(!input_is_stalled(&shared, None));
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_pending_once(writer.as_mut()).await;
+    assert!(input_is_stalled(&shared, None));
+
+    shared.close();
+    assert!(writer.await.is_err());
+    assert!(request.await.is_err());
+    assert!(!input_is_stalled(&shared, None));
 }
