@@ -27,8 +27,8 @@ const TOP_LEVEL_COMMAND_GROUPS: &[CommandGroup] = &[
         heading: "Sandboxes",
         commands: &[
             "run", "create", "restore", "modify", "start", "stop", "pause", "resume", "branch",
-            "restart", "ping", "touch", "list", "status", "metrics", "remove", "exec", "copy",
-            "logs", "ssh", "inspect", "sandbox",
+            "restart", "wait", "ping", "touch", "list", "status", "metrics", "remove", "exec",
+            "copy", "logs", "ssh", "inspect", "sandbox",
         ],
     },
     CommandGroup {
@@ -1117,6 +1117,22 @@ mod sandbox_command_tests {
     }
 
     #[test]
+    fn wait_accepts_both_timeout_spellings() {
+        for prefix in [&[][..], &["sandbox"][..], &["sbx"][..]] {
+            for flag in ["-t", "--timeout"] {
+                let SandboxCommands::Wait(args) =
+                    parse_sandbox(prefix, &["wait", "worker", flag, "30s", "--format", "json"])
+                else {
+                    panic!("expected the wait command");
+                };
+                assert_eq!(args.name, "worker");
+                assert_eq!(args.timeout.as_deref(), Some("30s"));
+                assert_eq!(args.format.as_deref(), Some("json"));
+            }
+        }
+    }
+
+    #[test]
     fn every_sandbox_operation_has_equivalent_public_spellings() {
         let cases: &[&[&str]] = &[
             &["run", "alpine", "--name", "demo", "--", "echo", "--help"],
@@ -1162,6 +1178,7 @@ mod sandbox_command_tests {
                 "branch", "demo", "--name", "child", "-v", "/data", "-p", "8081:80",
             ],
             &["restart", "demo"],
+            &["wait", "demo", "--timeout", "30s", "--format", "json"],
             &["ping", "demo"],
             &["touch", "demo"],
             &["list"],
