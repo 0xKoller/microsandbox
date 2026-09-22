@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -33,6 +33,7 @@ use tokio::net::UnixListener;
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
 use tokio::sync::{Mutex, mpsc, watch};
+use tokio::task::JoinSet;
 
 use crate::clock::spawn_clock_sync_task;
 use crate::console::ConsoleSharedState;
@@ -76,11 +77,9 @@ const LEN_PREFIX_SIZE: usize = 4;
 /// Capacity of the per-client write channel.
 const CLIENT_WRITE_CHANNEL_CAPACITY: usize = 64;
 
-/// Maximum time to retain a frame while the guest's receive ring is full.
-///
-/// A full ring normally clears as the guest consumes console input. If it does
-/// not, retaining the frame forever leaves the relay alive with no progress
-/// and can keep a runtime busy indefinitely.
+/// Time before a full guest input ring is considered stalled.
+/// Async delivery keeps the frame and gates new connections; synchronous
+/// startup/control delivery uses this duration as its blocking deadline.
 const RING_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Initial delay between retries of a full guest receive ring.
@@ -154,14 +153,6 @@ struct RawFrame {
     id: u32,
     /// The flags byte extracted from the frame header.
     flags: u8,
-}
-
-/// Outcome of trying to deliver a frame to the guest receive ring.
-enum RingWriteError {
-    /// Relay shutdown interrupted delivery before the frame was queued.
-    Cancelled,
-    /// The guest did not drain the receive ring before the delivery deadline.
-    Failed(RuntimeError),
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -419,12 +410,33 @@ impl AgentRelay {
     /// via `drain_tx` after forwarding the frame to agentd. The caller is
     /// expected to give agentd a flush window before forcing host-side
     /// teardown.
+    ///
+    /// After 60 seconds of input backpressure, reject new connections while
+    /// preserving existing requests and guest output. Admission resumes once
+    /// the pending frame reaches the guest. Callers retain their own timeouts.
     pub async fn run(
+        self,
+        shutdown: watch::Receiver<bool>,
+        drain_tx: mpsc::Sender<()>,
+    ) -> RuntimeResult<()> {
+        self.run_with_stall_timeout(
+            shutdown,
+            drain_tx,
+            RING_WRITE_TIMEOUT,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+    }
+
+    /// Internal timeout injection keeps saturation tests fast and deterministic.
+    async fn run_with_stall_timeout(
         mut self,
         mut shutdown: watch::Receiver<bool>,
         drain_tx: mpsc::Sender<()>,
+        stall_timeout: Duration,
+        stalled: Arc<AtomicBool>,
     ) -> RuntimeResult<()> {
-        let ready_frame = self.ready_frame.ok_or_else(|| {
+        let ready_frame = self.ready_frame.take().ok_or_else(|| {
             RuntimeError::Custom("agent relay: run() called before wait_ready()".into())
         })?;
 
@@ -441,10 +453,14 @@ impl AgentRelay {
         // Spawn the ring writer task (client frames → rx_ring → guest).
         let shared_for_writer = Arc::clone(&self.shared);
         let ring_writer_shutdown = shutdown.clone();
+        let mut client_readers = JoinSet::new();
+        let mut client_writers = JoinSet::new();
         let mut ring_writer_handle = tokio::spawn(ring_writer_task(
             shared_for_writer,
             agent_rx,
             ring_writer_shutdown,
+            stall_timeout,
+            Arc::clone(&stalled),
         ));
         let clock_sync_handle = spawn_clock_sync_task(agent_tx.clone());
 
@@ -478,10 +494,21 @@ impl AgentRelay {
 
         // Accept loop.
         loop {
+            // Reap completed tasks without cancelling a pending Windows pipe
+            // accept. JoinSet still owns and aborts live tasks on relay exit.
+            while client_readers.try_join_next().is_some() {}
+            while client_writers.try_join_next().is_some() {}
+
             tokio::select! {
                 accept_result = self.listener.accept() => {
                     match accept_result {
                         Ok(stream) => {
+                            // Accept and close rather than leaving callers in the listener
+                            // backlog. Existing streams remain attached throughout a stall.
+                            if stalled.load(Ordering::SeqCst) {
+                                drop(stream);
+                                continue;
+                            }
                             // Allocate a client slot.
                             let slot = {
                                 let mut slots = used_slots.lock().await;
@@ -533,7 +560,7 @@ impl AgentRelay {
                             // never holds the mutex across async writes.
                             let (write_tx, mut write_rx) =
                                 mpsc::channel::<Bytes>(CLIENT_WRITE_CHANNEL_CAPACITY);
-                            tokio::spawn(async move {
+                            client_writers.spawn(async move {
                                 while let Some(data) = write_rx.recv().await {
                                     if let Err(e) = writer_half.write_all(&data).await {
                                         tracing::error!(
@@ -561,7 +588,7 @@ impl AgentRelay {
                             let registry_clone = Arc::clone(&session_registry);
                             let next_id_clone = Arc::clone(&next_session_id);
 
-                            tokio::spawn(client_reader_task(
+                            client_readers.spawn(client_reader_task(
                                 slot,
                                 reader_half,
                                 agent_tx_clone,
@@ -579,32 +606,20 @@ impl AgentRelay {
                         }
                     }
                 }
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
                         tracing::info!("agent relay: shutdown signal received");
                         break;
                     }
                 }
                 ring_writer_result = &mut ring_writer_handle => {
-                    let error = match ring_writer_result {
-                        Ok(Ok(())) if *shutdown.borrow() => {
-                            tracing::debug!("agent relay: ring writer cancelled during shutdown");
-                            None
-                        }
-                        Ok(Ok(())) => Some(RuntimeError::Custom(
-                            "agent relay: ring writer task exited unexpectedly".into(),
-                        )),
-                        Ok(Err(error)) => Some(error),
-                        Err(error) => Some(RuntimeError::Custom(format!(
-                            "agent relay: ring writer task failed to join: {error}"
-                        ))),
-                    };
+                    let error = ring_writer_exit_error(ring_writer_result, &shutdown);
 
                     let Some(error) = error else {
                         break;
                     };
 
-                    tracing::error!(error = %error, "agent relay: ring writer stopped");
+                    tracing::error!(error = %error, "agent relay: ring writer stopped unexpectedly");
                     self.listener.cleanup(&self.endpoint);
                     clock_sync_handle.abort();
                     ring_reader_handle.abort();
@@ -777,6 +792,23 @@ fn tap_frame_into_log(frame: &RawFrame, writer: &LogWriter, session_registry: &S
     }
 }
 
+/// Distinguish normal shutdown from a failed or unexpectedly stopped writer.
+fn ring_writer_exit_error(
+    result: Result<RuntimeResult<()>, tokio::task::JoinError>,
+    shutdown: &watch::Receiver<bool>,
+) -> Option<RuntimeError> {
+    match result {
+        Ok(Ok(())) if *shutdown.borrow() || shutdown.has_changed().is_err() => None,
+        Ok(Ok(())) => Some(RuntimeError::Custom(
+            "agent relay: ring writer task exited unexpectedly".into(),
+        )),
+        Ok(Err(error)) => Some(error),
+        Err(error) => Some(RuntimeError::Custom(format!(
+            "agent relay: ring writer task failed to join: {error}"
+        ))),
+    }
+}
+
 /// Background task that pushes client frames into the rx_ring for the guest.
 /// Retries on a full ring with bounded exponential backoff, preserving frame
 /// ordering while avoiding a sustained timer-driven busy loop.
@@ -784,6 +816,8 @@ async fn ring_writer_task(
     shared: Arc<ConsoleSharedState>,
     mut rx: mpsc::Receiver<Vec<u8>>,
     mut shutdown: watch::Receiver<bool>,
+    stall_timeout: Duration,
+    stalled: Arc<AtomicBool>,
 ) -> RuntimeResult<()> {
     loop {
         let frame_bytes = tokio::select! {
@@ -801,14 +835,11 @@ async fn ring_writer_task(
             break;
         };
 
-        match push_guest_frame_async(&shared, frame_bytes, &mut shutdown, RING_WRITE_TIMEOUT).await
+        if !push_guest_frame_async(&shared, frame_bytes, &mut shutdown, stall_timeout, &stalled)
+            .await
         {
-            Ok(()) => {}
-            Err(RingWriteError::Cancelled) => {
-                tracing::debug!("agent relay: ring writer task cancelled");
-                break;
-            }
-            Err(RingWriteError::Failed(error)) => return Err(error),
+            tracing::debug!("agent relay: ring writer task cancelled");
+            break;
         }
     }
     tracing::debug!("agent relay: ring writer task exiting");
@@ -819,27 +850,32 @@ async fn ring_writer_task(
 ///
 /// The caller owns ordering by awaiting this function before accepting the
 /// next frame. A temporarily full ring is handled with exponential backoff;
-/// a permanently full ring returns an error after `timeout`, and shutdown
-/// cancels the wait immediately.
+/// sustained saturation closes new-client admission after `stall_timeout`.
+/// The pending frame is retained and retried at the capped delay until space
+/// returns or shutdown cancels delivery. Returns whether the frame was queued.
 async fn push_guest_frame_async(
     shared: &ConsoleSharedState,
     mut data: Vec<u8>,
     shutdown: &mut watch::Receiver<bool>,
-    timeout: Duration,
-) -> Result<(), RingWriteError> {
-    let deadline = Instant::now() + timeout;
+    stall_timeout: Duration,
+    stalled: &AtomicBool,
+) -> bool {
+    let deadline = Instant::now() + stall_timeout;
     let mut delay = RING_WRITE_RETRY_INITIAL_DELAY;
     let mut attempts = 0u64;
 
     loop {
         if *shutdown.borrow() {
-            return Err(RingWriteError::Cancelled);
+            return false;
         }
 
         match shared.rx_ring.push(data) {
             Ok(()) => {
                 shared.rx_wake.wake();
-                return Ok(());
+                if stalled.swap(false, Ordering::SeqCst) {
+                    tracing::info!("agent relay: guest input resumed; accepting new connections");
+                }
+                return true;
             }
             Err(returned) => {
                 data = returned;
@@ -854,22 +890,25 @@ async fn push_guest_frame_async(
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            let error = RuntimeError::Custom(format!(
-                "agent relay: timed out delivering frame after {attempts} retries"
-            ));
-            tracing::error!(error = %error, "agent relay: rx_ring stayed full");
-            return Err(RingWriteError::Failed(error));
+        if remaining.is_zero() && !stalled.swap(true, Ordering::SeqCst) {
+            tracing::warn!(
+                "agent relay: guest input stalled; rejecting new connections until input resumes"
+            );
         }
 
-        let wait = delay.min(remaining);
+        let wait = if remaining.is_zero() {
+            delay
+        } else {
+            delay.min(remaining)
+        };
+
         tokio::select! {
             _ = tokio::time::sleep(wait) => {
                 delay = delay.saturating_mul(2).min(RING_WRITE_RETRY_MAX_DELAY);
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    return Err(RingWriteError::Cancelled);
+                    return false;
                 }
             }
         }
@@ -1412,59 +1451,400 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ring_writer_delivers_after_temporary_backpressure() {
+    async fn stalled_writer_preserves_fifo_and_bounded_admission_then_recovers() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let shared = Arc::new(ConsoleSharedState::with_capacity(1));
+            shared.rx_ring.push(vec![0]).unwrap();
+
+            let (tx, rx) = mpsc::channel(1);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let stalled = Arc::new(AtomicBool::new(false));
+
+            let writer = tokio::spawn(ring_writer_task(
+                Arc::clone(&shared),
+                rx,
+                shutdown_rx,
+                Duration::from_millis(20),
+                Arc::clone(&stalled),
+            ));
+
+            let started = Instant::now();
+            tx.send(vec![1]).await.unwrap();
+
+            while !stalled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+
+            assert!(started.elapsed() >= Duration::from_millis(20));
+            assert!(
+                !writer.is_finished(),
+                "stall must preserve the pending frame"
+            );
+
+            tx.send(vec![2]).await.unwrap();
+            assert!(matches!(
+                tx.try_send(vec![3]),
+                Err(mpsc::error::TrySendError::Full(_))
+            ));
+
+            for expected in 0..=2 {
+                let frame = loop {
+                    if let Some(frame) = shared.rx_ring.pop() {
+                        break frame;
+                    }
+
+                    tokio::task::yield_now().await;
+                };
+
+                assert_eq!(frame, vec![expected]);
+            }
+
+            while stalled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+
+            assert!(shared.rx_ring.is_empty());
+
+            shutdown_tx.send(true).unwrap();
+            assert!(writer.await.unwrap().is_ok());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_writer_shutdown_cancels_without_delivering_input() {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let shared = Arc::new(ConsoleSharedState::with_capacity(1));
+            shared.rx_ring.push(vec![0]).unwrap();
+
+            let (tx, rx) = mpsc::channel(1);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let stalled = Arc::new(AtomicBool::new(false));
+
+            tx.send(vec![1]).await.unwrap();
+            let task = tokio::spawn(ring_writer_task(
+                Arc::clone(&shared),
+                rx,
+                shutdown_rx,
+                Duration::ZERO,
+                Arc::clone(&stalled),
+            ));
+
+            while !stalled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+
+            shutdown_tx.send(true).unwrap();
+            assert!(task.await.unwrap().is_ok());
+            assert_eq!(shared.rx_ring.pop(), Some(vec![0]));
+            assert!(shared.rx_ring.is_empty());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn temporary_backpressure_does_not_close_admission() {
         let shared = Arc::new(ConsoleSharedState::with_capacity(1));
         shared.rx_ring.push(vec![0]).unwrap();
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let shared_for_writer = Arc::clone(&shared);
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let stalled = Arc::new(AtomicBool::new(false));
+
+        let writer_shared = Arc::clone(&shared);
+        let writer_stalled = Arc::clone(&stalled);
         let writer = tokio::spawn(async move {
-            let mut shutdown = shutdown_rx;
             push_guest_frame_async(
-                &shared_for_writer,
+                &writer_shared,
                 vec![1],
                 &mut shutdown,
                 Duration::from_secs(1),
+                &writer_stalled,
             )
             .await
         });
 
         tokio::task::yield_now().await;
+        assert!(!stalled.load(Ordering::SeqCst));
         assert_eq!(shared.rx_ring.pop(), Some(vec![0]));
-        assert!(matches!(writer.await.unwrap(), Ok(())));
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), writer)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(!stalled.load(Ordering::SeqCst));
         assert_eq!(shared.rx_ring.pop(), Some(vec![1]));
     }
 
     #[tokio::test]
-    async fn ring_writer_times_out_when_guest_never_drains() {
-        let shared = Arc::new(ConsoleSharedState::with_capacity(1));
-        shared.rx_ring.push(vec![0]).unwrap();
-        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    #[cfg(unix)]
+    async fn stalled_relay_preserves_clients_and_output_then_reopens_admission() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let dir = tempfile::tempdir_in("/tmp").unwrap();
+            let endpoint = dir.path().join("agent.sock");
+            let shared = Arc::new(ConsoleSharedState::with_capacity(1));
+            let mut relay = AgentRelay::new(&endpoint, Arc::clone(&shared))
+                .await
+                .unwrap();
+            relay.ready_frame = Some(encoded_message(MessageType::Ready, &Ready::default()));
 
-        let result =
-            push_guest_frame_async(&shared, vec![1], &mut shutdown_rx, Duration::ZERO).await;
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (drain_tx, mut drain_rx) = mpsc::channel(1);
 
-        assert!(matches!(result, Err(RingWriteError::Failed(_))));
-        assert_eq!(shared.rx_ring.pop(), Some(vec![0]));
+            let mut client = tokio::net::UnixStream::connect(&endpoint).await.unwrap();
+            let stalled = Arc::new(AtomicBool::new(false));
+            let run = tokio::spawn(relay.run_with_stall_timeout(
+                shutdown_rx,
+                drain_tx,
+                Duration::from_millis(20),
+                Arc::clone(&stalled),
+            ));
+
+            let mut range = [0; 8];
+            client.read_exact(&mut range).await.unwrap();
+            let id = u32::from_be_bytes(range[..4].try_into().unwrap());
+            read_raw_frame(&mut client).await.unwrap();
+
+            // Hold input full while the existing client submits a request.
+            let _ = shared.rx_ring.push(vec![0]);
+            let request = Message::with_payload(MessageType::Ping, id, &()).unwrap();
+            let mut request_bytes = Vec::new();
+            codec::encode_to_buf(&request, &mut request_bytes).unwrap();
+            client.write_all(&request_bytes).await.unwrap();
+
+            // Observe the actual stall before probing, so slot exhaustion or
+            // an unrelated handshake failure cannot make this test pass.
+            while !stalled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+
+            let mut probe = tokio::net::UnixStream::connect(&endpoint).await.unwrap();
+            assert!(probe.read_exact(&mut range).await.is_err());
+
+            assert!(!run.is_finished());
+            assert!(drain_rx.try_recv().is_err());
+
+            // Guest output for the existing connection still flows while stalled.
+            let response = Message::with_payload(MessageType::Pong, id, &()).unwrap();
+            let mut response_bytes = Vec::new();
+            codec::encode_to_buf(&response, &mut response_bytes).unwrap();
+            shared.tx_ring.push(response_bytes).unwrap();
+            shared.tx_wake.wake();
+
+            let output = read_raw_frame(&mut client).await.unwrap();
+            assert_eq!(decode_frame(&output.data).unwrap().t, MessageType::Pong);
+
+            // Drain input until the retained request arrives exactly as submitted.
+            loop {
+                if let Some(bytes) = shared.rx_ring.pop()
+                    && bytes == request_bytes
+                {
+                    break;
+                }
+
+                tokio::task::yield_now().await;
+            }
+
+            // Keep draining maintenance/disconnect frames while reconnecting.
+            let draining_shared = Arc::clone(&shared);
+            let drainer = tokio::spawn(async move {
+                loop {
+                    draining_shared.rx_ring.pop();
+                    tokio::task::yield_now().await;
+                }
+            });
+
+            loop {
+                let mut probe = tokio::net::UnixStream::connect(&endpoint).await.unwrap();
+
+                if probe.read_exact(&mut range).await.is_ok() {
+                    assert_eq!(
+                        decode_frame(&read_raw_frame(&mut probe).await.unwrap().data)
+                            .unwrap()
+                            .t,
+                        MessageType::Ready
+                    );
+                    break;
+                }
+
+                tokio::task::yield_now().await;
+            }
+
+            // The original client is still connected after recovery.
+            shared
+                .tx_ring
+                .push(encoded_message(MessageType::Pong, &()))
+                .unwrap();
+            shared.tx_wake.wake();
+
+            let output = read_raw_frame(&mut client).await.unwrap();
+            assert_eq!(decode_frame(&output.data).unwrap().t, MessageType::Pong);
+
+            shutdown_tx.send(true).unwrap();
+            assert!(run.await.unwrap().is_ok());
+            drainer.abort();
+        })
+        .await
+        .expect("relay should preserve existing clients and recover");
+    }
+
+    #[test]
+    fn writer_exit_distinguishes_shutdown_from_unexpected_completion() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        assert!(ring_writer_exit_error(Ok(Ok(())), &shutdown_rx).is_some());
+
+        shutdown_tx.send(true).unwrap();
+        assert!(ring_writer_exit_error(Ok(Ok(())), &shutdown_rx).is_none());
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        drop(shutdown_tx);
+
+        assert!(ring_writer_exit_error(Ok(Ok(())), &shutdown_rx).is_none());
+        assert!(
+            ring_writer_exit_error(
+                Ok(Err(RuntimeError::Custom("writer failed".into()))),
+                &shutdown_rx,
+            )
+            .is_some()
+        );
     }
 
     #[tokio::test]
-    async fn ring_writer_shutdown_cancels_full_ring_cleanly() {
-        let shared = Arc::new(ConsoleSharedState::with_capacity(1));
-        shared.rx_ring.push(vec![0]).unwrap();
-        let (agent_tx, agent_rx) = mpsc::channel(1);
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        agent_tx.send(vec![1]).await.unwrap();
+    async fn writer_panic_is_a_failure_even_during_shutdown() {
+        let error = tokio::spawn(async {
+            panic!("injected writer panic");
+            #[allow(unreachable_code)]
+            Ok::<(), RuntimeError>(())
+        })
+        .await
+        .unwrap_err();
 
-        let writer = tokio::spawn(ring_writer_task(Arc::clone(&shared), agent_rx, shutdown_rx));
-        tokio::task::yield_now().await;
-        shutdown_tx.send(true).unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+        let failure = ring_writer_exit_error(Err(error), &shutdown_rx).unwrap();
 
-        let result = tokio::time::timeout(Duration::from_secs(1), writer)
-            .await
-            .expect("ring writer should stop promptly")
-            .unwrap();
-        assert!(result.is_ok(), "shutdown should not report a relay error");
-        assert_eq!(shared.rx_ring.pop(), Some(vec![0]));
+        assert!(failure.to_string().contains("injected writer panic"));
+    }
+
+    #[cfg(unix)]
+    type TestClient = tokio::net::UnixStream;
+
+    #[cfg(windows)]
+    type TestClient = tokio::net::windows::named_pipe::NamedPipeClient;
+
+    async fn connect_test_client(endpoint: &Path) -> TestClient {
+        #[cfg(unix)]
+        {
+            tokio::net::UnixStream::connect(endpoint).await.unwrap()
+        }
+
+        #[cfg(windows)]
+        {
+            loop {
+                match tokio::net::windows::named_pipe::ClientOptions::new().open(endpoint) {
+                    Ok(client) => return client,
+                    Err(error) if matches!(error.raw_os_error(), Some(2 | 231)) => {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(error) => panic!("connect test client: {error}"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn temporary_backpressure_allows_new_clients_and_clean_shutdown() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let endpoint = test_agent_endpoint("temporary-admission");
+            let shared = Arc::new(ConsoleSharedState::with_capacity(1));
+            let mut relay = AgentRelay::new(&endpoint, Arc::clone(&shared))
+                .await
+                .unwrap();
+            relay.ready_frame = Some(encoded_message(MessageType::Ready, &Ready::default()));
+
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (drain_tx, _drain_rx) = mpsc::channel(1);
+            let stalled = Arc::new(AtomicBool::new(false));
+            shared.rx_ring.push(vec![0]).unwrap();
+
+            let run = tokio::spawn(relay.run_with_stall_timeout(
+                shutdown_rx,
+                drain_tx,
+                Duration::from_secs(60),
+                Arc::clone(&stalled),
+            ));
+            let mut client = connect_test_client(&endpoint).await;
+            let mut range = [0; 8];
+            client.read_exact(&mut range).await.unwrap();
+            read_raw_frame(&mut client).await.unwrap();
+
+            let id = u32::from_be_bytes(range[..4].try_into().unwrap());
+            let request = Message::with_payload(MessageType::Ping, id, &()).unwrap();
+            let mut bytes = Vec::new();
+            codec::encode_to_buf(&request, &mut bytes).unwrap();
+            client.write_all(&bytes).await.unwrap();
+
+            let mut second = connect_test_client(&endpoint).await;
+            second.read_exact(&mut range).await.unwrap();
+            let ready = read_raw_frame(&mut second).await.unwrap();
+            assert_eq!(decode_frame(&ready.data).unwrap().t, MessageType::Ready);
+            assert!(!stalled.load(Ordering::SeqCst));
+
+            // Drain before the threshold and confirm that the retained request
+            // is delivered while both client connections are still alive.
+            loop {
+                if let Some(frame) = shared.rx_ring.pop()
+                    && frame == bytes
+                {
+                    break;
+                }
+
+                tokio::task::yield_now().await;
+            }
+
+            assert!(!stalled.load(Ordering::SeqCst));
+            drop(shutdown_tx);
+            assert!(run.await.unwrap().is_ok());
+
+            // Owned client tasks must close their streams during relay teardown.
+            assert!(read_raw_frame(&mut client).await.is_err());
+            assert!(read_raw_frame(&mut second).await.is_err());
+        })
+        .await
+        .expect("temporary backpressure must preserve admission");
+    }
+
+    #[tokio::test]
+    async fn client_completion_does_not_interrupt_new_connections() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let endpoint = test_agent_endpoint("connection-churn");
+            let shared = Arc::new(ConsoleSharedState::with_capacity(256));
+            let mut relay = AgentRelay::new(&endpoint, shared).await.unwrap();
+            relay.ready_frame = Some(encoded_message(MessageType::Ready, &Ready::default()));
+
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (drain_tx, _drain_rx) = mpsc::channel(1);
+            let run = tokio::spawn(relay.run(shutdown_rx, drain_tx));
+            let mut previous = None;
+
+            for _ in 0..32 {
+                // Finish the previous reader/writer while the next client connects.
+                drop(previous.take());
+                let mut client = connect_test_client(&endpoint).await;
+                let mut range = [0; 8];
+                client.read_exact(&mut range).await.unwrap();
+
+                let ready = read_raw_frame(&mut client).await.unwrap();
+                assert_eq!(decode_frame(&ready.data).unwrap().t, MessageType::Ready);
+                previous = Some(client);
+            }
+
+            shutdown_tx.send(true).unwrap();
+            assert!(run.await.unwrap().is_ok());
+        })
+        .await
+        .expect("client completion must not cancel the next connection");
     }
 }

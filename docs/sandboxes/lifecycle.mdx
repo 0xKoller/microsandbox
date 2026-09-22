@@ -31,6 +31,20 @@ stateDiagram-v2
 | **Stopped** | The VM has shut down. Sandbox configuration and state are persisted to the database and can be restarted. |
 | **Crashed** | The VM exited unexpectedly (e.g., kernel panic, OOM kill). |
 
+## Guest agent input stalls
+
+If the guest agent's input queue remains full for 60 seconds while a message
+is waiting, the relay rejects new connection attempts. Existing connections,
+pending requests, guest output, and log capture remain active. The VM and its
+workloads are not terminated because of the stall.
+
+The relay retains the blocked message and retries with a delay capped at
+100 milliseconds. Its bounded input channel applies backpressure to existing
+clients, so they cannot accumulate unlimited queued input in the relay. When
+the guest consumes input again, queued messages resume in order and the relay
+accepts new connections again. Request timeouts remain the caller's choice;
+a timeout does not prove that a guest operation did not run.
+
 ## Create a sandbox
 
 Creating a sandbox boots the microVM, mounts the filesystem, initializes the guest agent, and waits until it's ready to accept commands. Names must be non-empty and no longer than 128 UTF-8 bytes.
